@@ -3,6 +3,7 @@ from typing import Optional
 
 import aiosqlite
 
+# Глобальный путь к базе данных (устанавливается в init())
 DB_PATH = "data/bot.db"
 
 SCHEMA = """
@@ -14,6 +15,7 @@ CREATE TABLE IF NOT EXISTS users (
     full_name   TEXT,
     ref_code    TEXT UNIQUE,
     referrer_id INTEGER,
+    discount_percent INTEGER DEFAULT 0,
     created_at  TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -83,11 +85,20 @@ INSERT OR IGNORE INTO settings(key, value) VALUES
 
 
 async def init(path: str) -> None:
+    """Инициализирует базу данных и применяет миграции."""
     global DB_PATH
     DB_PATH = path
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
+        
+        # 🔧 МИГРАЦИЯ: добавляем колонку discount_percent, если её нет
+        try:
+            await db.execute("SELECT discount_percent FROM users LIMIT 1")
+        except Exception:
+            await db.execute("ALTER TABLE users ADD COLUMN discount_percent INTEGER DEFAULT 0")
+        
         await db.commit()
 
 
@@ -95,7 +106,9 @@ def _conn():
     return aiosqlite.connect(DB_PATH)
 
 
-# ---------- users ----------
+# ==========================================
+# USERS
+# ==========================================
 
 async def get_or_create_user(tg_user, referrer_id: Optional[int] = None) -> aiosqlite.Row:
     async with _conn() as db:
@@ -138,7 +151,9 @@ async def set_ref_code(user_id: int, code: str) -> None:
         await db.commit()
 
 
-# ---------- roles ----------
+# ==========================================
+# ROLES
+# ==========================================
 
 async def get_role(user_id: int, role: str) -> Optional[aiosqlite.Row]:
     async with _conn() as db:
@@ -180,7 +195,9 @@ async def list_active_by_role(role: str) -> list[aiosqlite.Row]:
         return await cur.fetchall()
 
 
-# ---------- settings ----------
+# ==========================================
+# SETTINGS
+# ==========================================
 
 async def get_setting(key: str, default: str = "") -> str:
     async with _conn() as db:
@@ -200,7 +217,9 @@ async def set_setting(key: str, value: str) -> None:
         await db.commit()
 
 
-# ---------- PR stats ----------
+# ==========================================
+# PR STATS
+# ==========================================
 
 async def pr_stats(user_id: int) -> dict:
     async with _conn() as db:
@@ -234,7 +253,9 @@ async def pr_stats(user_id: int) -> dict:
             "earned": earned, "staff": staff}
 
 
-# ---------- managers ----------
+# ==========================================
+# MANAGERS
+# ==========================================
 
 async def list_managers() -> list[aiosqlite.Row]:
     async with _conn() as db:
@@ -273,7 +294,9 @@ async def next_recipient(owner_id: int) -> Optional[int]:
     return chosen
 
 
-# ---------- projects ----------
+# ==========================================
+# PROJECTS
+# ==========================================
 
 async def create_project(
     client_id: int,
@@ -317,7 +340,9 @@ async def delete_project(project_id: int) -> None:
         await db.commit()
 
 
-# ---------- team & assignment ----------
+# ==========================================
+# TEAM & ASSIGNMENT
+# ==========================================
 
 async def set_team(project_id: int, members: list[tuple[int, str, int]]) -> None:
     async with _conn() as db:
@@ -335,12 +360,14 @@ async def get_team(project_id: int) -> list[aiosqlite.Row]:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM project_team WHERE project_id=? ORDER BY role_in_project",
-            (project_id,),
+            (project_id,)
         )
         return await cur.fetchall()
 
 
-# ---------- payouts ----------
+# ==========================================
+# PAYOUTS
+# ==========================================
 
 async def insert_payouts(project_id: int, lines: list[tuple]) -> None:
     async with _conn() as db:
@@ -367,7 +394,9 @@ async def company_balance() -> int:
         return (await cur.fetchone())["s"]
 
 
-# ---------- tables ----------
+# ==========================================
+# STATS
+# ==========================================
 
 async def list_projects(limit: int = 50) -> list[aiosqlite.Row]:
     async with _conn() as db:
@@ -396,8 +425,6 @@ async def project_details(project_id: int) -> dict:
 
     return {"project": project, "team": team, "payouts": payouts}
 
-
-# ---------- stats ----------
 
 async def general_stats() -> dict:
     async with _conn() as db:
@@ -470,3 +497,50 @@ async def ref_stats(ref_id: int) -> dict:
 
     return {"clients": clients, "orders": orders, "total": total,
             "earned": earned, "staff": staff}
+
+
+# ==========================================
+# DISCOUNTS
+# ==========================================
+
+async def increment_referrer_discount(ref_code: str):
+    """Увеличивает скидку рефереру на 1% за каждого приведённого клиента."""
+    async with _conn() as db:
+        cursor = await db.execute(
+            "SELECT telegram_id FROM users WHERE ref_code = ?", (ref_code,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return
+        
+        referrer_id = row[0]
+        await db.execute(
+            "UPDATE users SET discount_percent = COALESCE(discount_percent, 0) + 1 WHERE telegram_id = ?",
+            (referrer_id,)
+        )
+        await db.commit()
+
+
+async def increment_discount_by_user_id(user_id: int) -> int:
+    """Увеличивает скидку пользователя на 1% и возвращает новое значение."""
+    async with _conn() as db:
+        await db.execute(
+            "UPDATE users SET discount_percent = COALESCE(discount_percent, 0) + 1 WHERE telegram_id = ?",
+            (user_id,)
+        )
+        await db.commit()
+        cur = await db.execute("SELECT discount_percent FROM users WHERE telegram_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else 1
+
+
+async def get_user_discount(user_id: int) -> int:
+    """Возвращает текущую скидку пользователя в процентах."""
+    async with _conn() as db:
+        cursor = await db.execute(
+            "SELECT discount_percent FROM users WHERE telegram_id = ?", (user_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return 0
+        return row[0] or 0
