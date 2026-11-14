@@ -1,102 +1,145 @@
-from aiogram import Router, F, Bot
+import logging
+
+from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message
 
 import db
-import texts
-from keyboards import dev_moderation_kb
-from states import DevForm
 from config import config
+from states import DevForm
+from keyboards import main_menu, dev_moderation_kb
 
+logger = logging.getLogger(__name__)
 router = Router()
-
-LEVELS = {"junior": "junior", "medium": "medium", "senior": "senior"}
 
 
 @router.message(DevForm.name)
-async def dev_name(message: Message, state: FSMContext):
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Напишите имя.")
-        return
-    await state.update_data(name=name[:100])
+async def process_name(message: Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "cancel", "отменить"]:
+        await state.clear()
+        return await message.answer("❌ Заявка отменена.", reply_markup=main_menu())
+
+    await state.update_data(name=message.text.strip())
+    await state.set_state(DevForm.experience)
+    await message.answer(
+        "📝 <b>Шаг 2/4:</b> Опишите свой опыт в разработке.\n"
+        "<i>Какие языки знаете, какие проекты делали?</i>",
+        parse_mode="HTML"
+    )
+
+
+@router.message(DevForm.experience)
+async def process_experience(message: Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "cancel", "отменить"]:
+        await state.clear()
+        return await message.answer("❌ Заявка отменена.", reply_markup=main_menu())
+
+    await state.update_data(experience=message.text.strip())
     await state.set_state(DevForm.level)
-    await message.answer(texts.DEV_ASK_LEVEL)
+    await message.answer(
+        "📝 <b>Шаг 3/4:</b> На какой уровень претендуете?\n\n"
+        "• <b>junior</b> — начинающий\n"
+        "• <b>medium</b> — средний уровень\n"
+        "• <b>senior</b> — опытный разработчик\n\n"
+        "Напишите одно слово: <code>junior</code>, <code>medium</code> или <code>senior</code>",
+        parse_mode="HTML"
+    )
 
 
 @router.message(DevForm.level)
-async def dev_level(message: Message, state: FSMContext):
-    raw = (message.text or "").strip().lower()
-    if raw not in LEVELS:
-        await message.answer("Напишите одно слово: Senior, Medium или Junior.")
-        return
-    await state.update_data(level=LEVELS[raw])
-    await state.set_state(DevForm.solution)
-    await message.answer(texts.DEV_TASKS[raw])
+async def process_level(message: Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "cancel", "отменить"]:
+        await state.clear()
+        return await message.answer("❌ Заявка отменена.", reply_markup=main_menu())
+
+    level = message.text.strip().lower()
+    if level not in ["junior", "medium", "senior"]:
+        return await message.answer(
+            "⚠️ Пожалуйста, напишите одно из трёх: <code>junior</code>, <code>medium</code> или <code>senior</code>",
+            parse_mode="HTML"
+        )
+
+    await state.update_data(level=level)
+    await state.set_state(DevForm.portfolio)
+    await message.answer(
+        "📝 <b>Шаг 4/4:</b> Ссылка на портфолио (GitHub, сайт, примеры работ).\n"
+        "<i>Если нет портфолио — напишите 'нет'</i>",
+        parse_mode="HTML"
+    )
 
 
-@router.message(DevForm.solution)
-async def dev_solution(message: Message, state: FSMContext, bot: Bot):
-    if not (message.text or message.document):
-        await message.answer("Пришлите решение текстом или файлом.")
-        return
+@router.message(DevForm.portfolio)
+async def process_portfolio(message: Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "cancel", "отменить"]:
+        await state.clear()
+        return await message.answer("❌ Заявка отменена.", reply_markup=main_menu())
 
+    portfolio = message.text.strip()
     data = await state.get_data()
     await state.clear()
-    uid = message.from_user.id
-    level = data["level"]
-    name = data["name"]
 
-    await db.upsert_role(uid, "dev", status="pending", level=level)
+    user_id = message.from_user.id
+    username = message.from_user.username or "нет username"
 
-    owner_text = (
-        f"👨‍💻 <b>Заявка разработчика</b>\n\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Имя: {name}\n"
-        f"Username: @{message.from_user.username or '—'}\n"
-        f"Уровень: <b>{level}</b>\n\n"
-        f"<b>Решение:</b>"
-    )
-    await bot.send_message(config.owner_id, owner_text,
-                           reply_markup=dev_moderation_kb(uid))
-
-    if message.document:
-        await bot.send_message(
-            config.owner_id,
-            f"📎 Файл от <code>{uid}</code>:",
-            document=message.document.file_id,
+    try:
+        # Сохраняем заявку со статусом pending
+        await db.upsert_role(
+            user_id=user_id,
+            role="dev",
+            status="pending",
+            level=data["level"],
+            referrer_text=(
+                f"Имя: {data['name']}\n"
+                f"Опыт: {data['experience']}\n"
+                f"Портфолио: {portfolio}"
+            )
         )
-    else:
-        text = message.text[:3500]
-        await bot.send_message(config.owner_id, f"<pre>{text}</pre>")
 
-    await message.answer(texts.DEV_SENT)
+        await message.answer(
+            "✅ <b>Ваша заявка на разработчика отправлена!</b>\n\n"
+            "Менеджер рассмотрит её в ближайшее время и свяжется с вами.\n"
+            "Спасибо за интерес к команде A.T.L.A.S.!",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
 
+        # Уведомляем владельца и менеджеров
+        notification = (
+            f"🆕 <b>Новая заявка на разработчика!</b>\n\n"
+            f"👤 <b>Пользователь:</b> <code>{user_id}</code> (@{username})\n"
+            f"📝 <b>Имя:</b> {data['name']}\n"
+            f"🎯 <b>Уровень:</b> {data['level']}\n"
+            f"💼 <b>Опыт:</b> {data['experience']}\n"
+            f"🔗 <b>Портфолио:</b> {portfolio}"
+        )
 
-@router.callback_query(F.data.startswith("dev:"))
-async def dev_moderate(cb: CallbackQuery, bot: Bot):
-    if cb.from_user.id != config.owner_id:
-        await cb.answer("Только владелец.", show_alert=True)
-        return
-
-    _, action, raw_id = cb.data.split(":")
-    uid = int(raw_id)
-    role = await db.get_role(uid, "dev")
-    level = role["level"] if role else "junior"
-
-    if action == "approve":
-        await db.upsert_role(uid, "dev", status="active", level=level)
-        await cb.message.edit_text(cb.message.html_text + "\n\n✅ Одобрено")
+        # Отправляем владельцу с кнопками модерации
         try:
-            await bot.send_message(uid, texts.DEV_APPROVED.format(level=level))
-        except Exception:
-            pass
-    else:
-        await db.upsert_role(uid, "dev", status="rejected", level=level)
-        await cb.message.edit_text(cb.message.html_text + "\n\n❌ Отклонено")
-        try:
-            await bot.send_message(uid, texts.DEV_REJECTED)
-        except Exception:
-            pass
+            await message.bot.send_message(
+                config.owner_id,
+                notification,
+                parse_mode="HTML",
+                reply_markup=dev_moderation_kb(user_id)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка уведомления владельца: {e}")
 
-    await cb.answer()
+        # Отправляем активным менеджерам
+        managers = await db.list_managers()
+        for m in managers:
+            if m.get("status") == "active":
+                try:
+                    await message.bot.send_message(
+                        m["telegram_id"],
+                        notification,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления менеджера {m['telegram_id']}: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки заявки dev: {e}")
+        await message.answer(
+            "❌ Произошла ошибка при отправке заявки. Попробуйте позже.",
+            reply_markup=main_menu()
+        )
