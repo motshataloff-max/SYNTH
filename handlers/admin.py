@@ -7,6 +7,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram import Bot
 from aiogram.types import Message, CallbackQuery, FSInputFile
 
 import db
