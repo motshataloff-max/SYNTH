@@ -1,67 +1,81 @@
-from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery
+import logging
+
+from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
 
 import db
-import texts
-from keyboards import pr_moderation_kb
-from states import PRForm
 from config import config
+from states import PRForm
+from keyboards import main_menu, pr_moderation_kb
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 
-def pr_link(user_id: int) -> str:
-    return f"https://t.me/{config.bot_username}?start=ref_{user_id}"
-
-
 @router.message(PRForm.waiting_referrer)
-async def pr_referrer(message: Message, state: FSMContext, bot: Bot):
-    text = (message.text or "").strip()
-    if len(text) < 2:
-        await message.answer("Напишите чуть подробнее, кто вас привёл.")
-        return
+async def process_referrer(message: Message, state: FSMContext):
+    if message.text and message.text.lower() in ["отмена", "cancel", "отменить"]:
+        await state.clear()
+        return await message.answer("❌ Заявка отменена.", reply_markup=main_menu())
+
+    referrer_text = message.text.strip()
+    await state.update_data(referrer_text=referrer_text)
     await state.clear()
 
-    uid = message.from_user.id
-    await db.upsert_role(uid, "pr", status="pending", referrer_text=text[:500])
+    user_id = message.from_user.id
+    username = message.from_user.username or "нет username"
 
-    owner_text = (
-        "📣 <b>Новая заявка на пиарщика</b>\n\n"
-        f"ID: <code>{uid}</code>\n"
-        f"Имя: {message.from_user.full_name}\n"
-        f"Username: @{message.from_user.username or '—'}\n"
-        f"Кто привёл: <b>{text[:500]}</b>"
-    )
-    await bot.send_message(config.owner_id, owner_text,
-                           reply_markup=pr_moderation_kb(uid))
-    await message.answer(texts.PR_SENT)
+    try:
+        # Сохраняем заявку со статусом pending
+        await db.upsert_role(
+            user_id=user_id,
+            role="pr",
+            status="pending",
+            referrer_text=referrer_text
+        )
 
+        await message.answer(
+            "✅ <b>Ваша заявка на пиарщика отправлена!</b>\n\n"
+            "Менеджер рассмотрит её в ближайшее время и свяжется с вами.\n"
+            "Спасибо за интерес к команде A.T.L.A.S.!",
+            parse_mode="HTML",
+            reply_markup=main_menu()
+        )
 
-@router.callback_query(F.data.startswith("pr:"))
-async def pr_moderate(cb: CallbackQuery, bot: Bot):
-    if cb.from_user.id != config.owner_id:
-        await cb.answer("Только владелец.", show_alert=True)
-        return
+        # Уведомляем владельца с кнопками модерации
+        notification = (
+            f"🆕 <b>Новая заявка на пиарщика!</b>\n\n"
+            f"👤 <b>Пользователь:</b> <code>{user_id}</code> (@{username})\n"
+            f"📝 <b>Информация:</b> {referrer_text}"
+        )
 
-    _, action, raw_id = cb.data.split(":")
-    uid = int(raw_id)
-
-    if action == "approve":
-        await db.upsert_role(uid, "pr", status="active")
-        await db.set_ref_code(uid, f"ref_{uid}")
-        await cb.message.edit_text(cb.message.html_text + "\n\n✅ Одобрено")
         try:
-            await bot.send_message(uid, "Ваша заявка одобрена!\n\n" +
-                                   texts.PR_LINK_TEXT.format(link=pr_link(uid)))
-        except Exception:
-            pass
-    else:
-        await db.upsert_role(uid, "pr", status="rejected")
-        await cb.message.edit_text(cb.message.html_text + "\n\n❌ Отклонено")
-        try:
-            await bot.send_message(uid, texts.PR_REJECTED)
-        except Exception:
-            pass
+            await message.bot.send_message(
+                config.owner_id,
+                notification,
+                parse_mode="HTML",
+                reply_markup=pr_moderation_kb(user_id)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка уведомления владельца: {e}")
 
-    await cb.answer()
+        # Отправляем активным менеджерам
+        managers = await db.list_managers()
+        for m in managers:
+            if m.get("status") == "active":
+                try:
+                    await message.bot.send_message(
+                        m["telegram_id"],
+                        notification,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка уведомления менеджера {m['telegram_id']}: {e}")
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки заявки pr: {e}")
+        await message.answer(
+            "❌ Произошла ошибка при отправке заявки. Попробуйте позже.",
+            reply_markup=main_menu()
+        )
